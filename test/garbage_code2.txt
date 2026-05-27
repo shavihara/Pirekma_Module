@@ -1,0 +1,390 @@
+// Adapted to the FirebaseClient library API (async client + UserAuth)
+#define ENABLE_USER_AUTH
+#define ENABLE_DATABASE
+
+#include <Arduino.h>
+#if defined(ESP32)
+#include <WiFi.h>
+#elif defined(ESP8266)
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClient.h>
+#endif
+#include <FirebaseClient.h>
+#include <ArduinoJson.h>
+#include "ExampleFunctions.h"
+#include <time.h>
+#include <sys/time.h>
+
+// === Configuration ===
+#ifdef WIFI_SSID
+#undef WIFI_SSID
+#endif
+#define WIFI_SSID "SLT-4G_1F9CB1" 
+
+#ifdef WIFI_PASSWORD
+#undef WIFI_PASSWORD
+#endif
+#define WIFI_PASSWORD "2CEFF1FF"
+
+#ifdef FIREBASE_DATABASE_URL
+#undef FIREBASE_DATABASE_URL
+#endif
+#define FIREBASE_DATABASE_URL "https://tst-09999-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+#ifdef FIREBASE_API_KEY
+#undef FIREBASE_API_KEY
+#endif
+#define FIREBASE_API_KEY "AIzaSyAWOTmomJ9B-aZctfyccEMgn7zzWNZpnIs"
+
+#ifdef FIREBASE_AUTH_EMAIL
+#undef FIREBASE_AUTH_EMAIL
+#endif
+#define FIREBASE_AUTH_EMAIL "device_1_colombo@yourdomain.com"
+
+#ifdef FIREBASE_AUTH_PASSWORD
+#undef FIREBASE_AUTH_PASSWORD
+#endif
+#define FIREBASE_AUTH_PASSWORD "device123"
+
+#ifdef CONFIG_DEVICE_ID
+#undef CONFIG_DEVICE_ID
+#endif
+#define CONFIG_DEVICE_ID "esp32_device_1"
+
+#ifdef CONFIG_PLANT_ID
+#undef CONFIG_PLANT_ID
+#endif
+#define CONFIG_PLANT_ID "plant_colombo"
+
+// === Firebase Paths ===
+#define FIREBASE_PATH_TELEMETRY "plants/" CONFIG_PLANT_ID "/devices/" CONFIG_DEVICE_ID "/telemetry"
+#define FIREBASE_PATH_INFO "plants/" CONFIG_PLANT_ID "/devices/" CONFIG_DEVICE_ID "/info"
+#define FIREBASE_PATH_LIMITS "plants/" CONFIG_PLANT_ID "/devices/" CONFIG_DEVICE_ID "/config/limits"
+#define FIREBASE_PATH_DEVICE "plants/" CONFIG_PLANT_ID "/devices/" CONFIG_DEVICE_ID
+
+// === Timing ===
+#define TELEMETRY_INTERVAL_MS 10000  // 10 seconds
+#define WIFI_TIMEOUT_MS 30000       // 30 second WiFi connection timeout
+
+// === Vercel Webhook ===
+#define VERCEL_WEBHOOK_URL "https://your-vercel-webhook-url.vercel.app/api/emergency"
+
+// === Global Objects ===
+SSL_CLIENT ssl_client;
+SSL_CLIENT ssl_client_stream; // Dedicated SSL client for SSE stream
+using AsyncClient = AsyncClientClass;
+AsyncClient aClient(ssl_client);
+AsyncClient aClientStream(ssl_client_stream); // Dedicated AsyncClient for SSE stream
+
+UserAuth user_auth(FIREBASE_API_KEY, FIREBASE_AUTH_EMAIL, FIREBASE_AUTH_PASSWORD, 3600);
+FirebaseApp app;
+RealtimeDatabase Database;
+AsyncResult databaseResult;
+AsyncResult limitsResult;
+
+// === Smart Edge: Local Sensor Limits (RAM) ===
+struct SensorLimits {
+    float temp_max = 190.0;
+    float hum_max = 90.0;
+} localLimits;
+
+// === Function Declarations ===
+void connectWiFi();
+void sendTelemetry();
+void processData(AsyncResult &aResult);
+void fetchLimits();
+void checkEmergencyAndNotify(float temperature, float humidity);
+void sendEmergencyToVercel(float temperature, float humidity);
+
+// === WiFi Connection ===
+void connectWiFi() {
+    Serial.println("Connecting to WiFi...");
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    unsigned long startAttempt = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < WIFI_TIMEOUT_MS) {
+        Serial.print(".");
+        delay(300);
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println();
+        Serial.println("WiFi connected!");
+        Serial.print("IP address: ");
+        Serial.println(WiFi.localIP());
+
+        // Sync time via NTP
+        Serial.println("Syncing NTP time...");
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        delay(500);
+
+        time_t now = time(nullptr);
+        if (now > 1000000000) {
+            Serial.print("NTP synced: ");
+            Serial.println(ctime(&now));
+        } else {
+            Serial.println("NTP sync failed, using millis() fallback");
+        }
+    } else {
+        Serial.println();
+        Serial.println("WiFi connection FAILED. Will retry...");
+    }
+}
+
+// === Fetch limits from Firebase (Smart Edge - streaming approach) ===
+void fetchLimits() {
+    Serial.print("Subscribing to limits stream on Firebase path: ");
+    Serial.println(FIREBASE_PATH_LIMITS);
+    Database.get(aClientStream, FIREBASE_PATH_LIMITS, limitsResult, true /* SSE mode */);
+}
+
+// === Check emergency and notify ===
+void checkEmergencyAndNotify(float temperature, float humidity) {
+    bool emergency = false;
+    float emergencyValue = 0;
+    String emergencyType = "";
+
+    if (temperature > localLimits.temp_max) {
+        emergency = true;
+        emergencyValue = temperature;
+        emergencyType = "temperature";
+        Serial.printf("EMERGENCY: Temperature %.1f exceeds limit %.1f\n", temperature, localLimits.temp_max);
+    }
+
+    if (humidity > localLimits.hum_max) {
+        emergency = true;
+        emergencyValue = humidity;
+        emergencyType = "humidity";
+        Serial.printf("EMERGENCY: Humidity %.1f exceeds limit %.1f\n", humidity, localLimits.hum_max);
+    }
+
+    if (emergency) {
+        String payload = "{"
+            "\"emergency\":true,"
+            "\"emergencyType\":\"" + emergencyType + "\","
+            "\"emergencyValue\":" + String(emergencyValue, 1) + ","
+            "\"temp_max\":" + String(localLimits.temp_max, 1) + ","
+            "\"hum_max\":" + String(localLimits.hum_max, 1) + ","
+            "\"timestamp\":" + String(millis()) + "}";
+
+        Database.update(aClient, FIREBASE_PATH_TELEMETRY, object_t(payload), databaseResult);
+
+        sendEmergencyToVercel(temperature, humidity);
+    }
+}
+
+// === Send emergency HTTP POST to Vercel ===
+void sendEmergencyToVercel(float temperature, float humidity) {
+#if defined(ESP8266)
+    WiFiClient client;
+    HTTPClient http;
+    http.begin(client, VERCEL_WEBHOOK_URL);
+    http.addHeader("Content-Type", "application/json");
+
+    String payload = "{"
+        "\"deviceId\":\"" CONFIG_DEVICE_ID "\","
+        "\"plantId\":\"" CONFIG_PLANT_ID "\","
+        "\"temperature\":" + String(temperature, 1) + ","
+        "\"humidity\":" + String(humidity, 1) + ","
+        "\"temp_max\":" + String(localLimits.temp_max, 1) + ","
+        "\"hum_max\":" + String(localLimits.hum_max, 1) + ","
+        "\"emergency\":true"
+        "}";
+
+    int httpCode = http.POST(payload);
+    Serial.printf("Vercel webhook response code: %d\n", httpCode);
+    http.end();
+#endif
+}
+
+// === Send Telemetry Data ===
+void sendTelemetry() {
+    float temperature = random(150, 351) / 10.0;  // 15.0 - 35.0 °C
+    float humidity = random(400, 901) / 10.0;      // 40.0 - 90.0 %
+    float pressure = random(60, 121) / 10.0;       // 6.0 - 12.0 psi
+
+    Serial.println("=== Sending Telemetry ===");
+    Serial.print("Temperature: "); Serial.print(temperature, 1); Serial.println(" °C");
+    Serial.print("Humidity: "); Serial.print(humidity, 1); Serial.println(" %");
+    Serial.print("Pressure: "); Serial.print(pressure, 1); Serial.println(" psi");
+    Serial.print("Local Limits -> temp_max: "); Serial.print(localLimits.temp_max);
+    Serial.print(", hum_max: "); Serial.println(localLimits.hum_max);
+
+    // Check for emergency conditions (Smart Edge logic)
+    checkEmergencyAndNotify(temperature, humidity);
+
+    // Use Firebase server timestamp for consistent time across all clients
+    String payload = "{\"telemetry\":{"
+                     "\"temperature\":" + String(temperature, 1) + ","
+                     "\"humidity\":" + String(humidity, 1) + ","
+                     "\"pressure\":" + String(pressure, 1) + ","
+                     "\"timestamp\":{\".sv\":\"timestamp\"}},"
+                     "\"info\":{"
+                     "\"online\":true,"
+                     "\"lastPing\":{\".sv\":\"timestamp\"}}}";
+
+    String devicePath = "plants/" CONFIG_PLANT_ID "/devices/" CONFIG_DEVICE_ID;
+
+    Database.update(aClient, devicePath.c_str(), object_t(payload), databaseResult);
+}
+
+// === Process async results ===
+void processData(AsyncResult &aResult)
+{
+    if (!aResult.isResult())
+        return;
+
+    if (aResult.isEvent())
+    {
+        Firebase.printf("Event task: %s, msg: %s, code: %d\n", aResult.uid().c_str(), aResult.eventLog().message().c_str(), aResult.eventLog().code());
+    }
+
+    if (aResult.isDebug())
+    {
+        Firebase.printf("Debug task: %s, msg: %s\n", aResult.uid().c_str(), aResult.debug().c_str());
+    }
+
+    if (aResult.isError())
+    {
+        Firebase.printf("Error task: %s, msg: %s, code: %d\n", aResult.uid().c_str(), aResult.error().message().c_str(), aResult.error().code());
+    }
+
+    if (aResult.available())
+    {
+        Firebase.printf("task: %s, payload: %s\n", aResult.uid().c_str(), aResult.c_str());
+
+        // Parse limits from Firebase response (Smart Edge)
+        if (&aResult == &limitsResult) {
+            RealtimeDatabaseResult &RTDB = aResult.to<RealtimeDatabaseResult>();
+            if (RTDB.isStream()) {
+                String eventType = RTDB.event().c_str();
+                String dataPath = RTDB.dataPath().c_str();
+                String payload = RTDB.data().c_str();
+                
+                Serial.printf("Stream Event: %s, Path: %s, Payload: %s\n", eventType.c_str(), dataPath.c_str(), payload.c_str());
+
+                if (eventType == "put" || eventType == "patch") {
+                    if (dataPath == "/" || dataPath == "") {
+                        // The payload is the entire limits JSON object
+                        ArduinoJson::JsonDocument doc;
+                        if (ArduinoJson::DeserializationError::Ok == ArduinoJson::deserializeJson(doc, payload.c_str())) {
+                            ArduinoJson::JsonObject root = doc.as<ArduinoJson::JsonObject>();
+                            
+                            // Parse temperature limit (supports temp_max and temperature_max)
+                            if (!root["temp_max"].isNull()) {
+                                localLimits.temp_max = root["temp_max"].as<float>();
+                                Serial.printf("Stream updated temp_max: %.1f\n", localLimits.temp_max);
+                            } else if (!root["temperature_max"].isNull()) {
+                                localLimits.temp_max = root["temperature_max"].as<float>();
+                                Serial.printf("Stream updated temp_max (from temperature_max): %.1f\n", localLimits.temp_max);
+                            }
+
+                            // Parse humidity limit (supports hum_max and humidity_max)
+                            if (!root["hum_max"].isNull()) {
+                                localLimits.hum_max = root["hum_max"].as<float>();
+                                Serial.printf("Stream updated hum_max: %.1f\n", localLimits.hum_max);
+                            } else if (!root["humidity_max"].isNull()) {
+                                localLimits.hum_max = root["humidity_max"].as<float>();
+                                Serial.printf("Stream updated hum_max (from humidity_max): %.1f\n", localLimits.hum_max);
+                            }
+                        }
+                    } else if (dataPath == "/temp_max" || dataPath == "/temperature_max") {
+                        localLimits.temp_max = payload.toFloat();
+                        Serial.printf("Stream updated temp_max (single): %.1f\n", localLimits.temp_max);
+                    } else if (dataPath == "/hum_max" || dataPath == "/humidity_max") {
+                        localLimits.hum_max = payload.toFloat();
+                        Serial.printf("Stream updated hum_max (single): %.1f\n", localLimits.hum_max);
+                    }
+                }
+            } else {
+                // One-time GET fallback parsing
+                ArduinoJson::JsonDocument doc;
+                if (ArduinoJson::DeserializationError::Ok == ArduinoJson::deserializeJson(doc, aResult.c_str())) {
+                    ArduinoJson::JsonObject root = doc.as<ArduinoJson::JsonObject>();
+                    
+                    // Parse temperature limit (supports temp_max and temperature_max)
+                    if (!root["temp_max"].isNull()) {
+                        localLimits.temp_max = root["temp_max"].as<float>();
+                        Serial.printf("Updated temp_max: %.1f\n", localLimits.temp_max);
+                    } else if (!root["temperature_max"].isNull()) {
+                        localLimits.temp_max = root["temperature_max"].as<float>();
+                        Serial.printf("Updated temp_max (from temperature_max): %.1f\n", localLimits.temp_max);
+                    }
+
+                    // Parse humidity limit (supports hum_max and humidity_max)
+                    if (!root["hum_max"].isNull()) {
+                        localLimits.hum_max = root["hum_max"].as<float>();
+                        Serial.printf("Updated hum_max: %.1f\n", localLimits.hum_max);
+                    } else if (!root["humidity_max"].isNull()) {
+                        localLimits.hum_max = root["humidity_max"].as<float>();
+                        Serial.printf("Updated hum_max (from humidity_max): %.1f\n", localLimits.hum_max);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// === Setup ===
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    Serial.println();
+    Serial.println("===========================================");
+    Serial.println("  ESP32 Firebase Telemetry v1.0");
+    Serial.println("  Industrial Plant Monitoring");
+    Serial.println("  Smart Edge IoT Architecture");
+    Serial.println("===========================================");
+    Serial.println();
+
+    // Connect to WiFi
+    connectWiFi();
+
+    // Configure SSL clients
+    set_ssl_client_insecure_and_buffer(ssl_client);
+    set_ssl_client_insecure_and_buffer(ssl_client_stream);
+
+    // Initialize Firebase app with user auth and debug callback
+    initializeApp(aClient, app, getAuth(user_auth), auth_debug_print);
+
+    // Attach RealtimeDatabase instance and set URL
+    app.getApp<RealtimeDatabase>(Database);
+    Database.url(FIREBASE_DATABASE_URL);
+
+    // Set filters for the stream client (SSE stream)
+    aClientStream.setSSEFilters("get,put,patch,keep-alive,cancel,auth_revoked");
+
+    // Initiate real-time subscription
+    fetchLimits();
+}
+
+unsigned long lastSend = 0;
+
+void loop() {
+    // Maintain Firebase tasks
+    app.loop();
+
+    // Handle async database result
+    processData(databaseResult);
+    processData(limitsResult);
+
+    // Reconnect WiFi if disconnected
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi disconnected. Reconnecting...");
+        WiFi.reconnect();
+        delay(1000);
+    }
+
+    // Send telemetry at configured interval
+    unsigned long now = millis();
+    if (now - lastSend >= TELEMETRY_INTERVAL_MS) {
+        if (app.ready())
+            sendTelemetry();
+        lastSend = now;
+    }
+
+    delay(10);
+}
